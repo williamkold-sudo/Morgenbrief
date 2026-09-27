@@ -1,0 +1,45 @@
+name: Morgenbrief
+
+on:
+  schedule:
+    # GitHub bruger UTC. 06:00 UTC = 08:00 sommertid, 07:00 UTC = 08:00 vintertid.
+    # Scriptet poster kun ved den kørsel, hvor klokken er 08 i København.
+    - cron: "0 6 * * *"
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Post nu, uanset klokkeslæt"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer pakker
+        run: pip install -r requirements.txt
+
+      - name: Lav og post morgenbrief
+        run: python morgenbrief.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+
+      - name: Gem dagens brief (til at undgå gentagelser i morgen)
+        run: |
+          git config user.name "morgenbrief-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/ 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "Morgenbrief $(date -u +%F)" && git push)
