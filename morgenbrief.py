@@ -8,6 +8,7 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -63,7 +64,8 @@ For hver sektion skal du:
   flere kilder – ikke én historie pr. kilde.
 - Dække hovedtemaet i dybden plus 1–2 sekundære udviklinger.
 - Nævne hvor kilderne er uenige eller vægter forskelligt, og hvad man skal holde øje med.
-- Angive de 2–4 artikler du faktisk har brugt (kildenavn + artiklens url).
+- Angive de 2–4 artikler du faktisk har brugt, som en liste af objekter med
+  "navn" (kildens navn, fx "BBC") og "url" (artiklens adresse).
 
 Regler:
 - Skriv naturligt, flydende dansk, også når kilderne er engelske. Behold navne,
@@ -217,11 +219,49 @@ def generate(articles, previous, now):
     )
     for block in resp.content:
         if block.type == "tool_use":
-            return block.input
+            return normalize(block.input)
     raise RuntimeError("Claude leverede ikke nogen brief.")
 
 
 # --- Slack -----------------------------------------------------------------
+def _as_list(v):
+    """Accepterer både en liste og en liste skrevet som tekst."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return []
+    return v if isinstance(v, list) else []
+
+
+def normalize(brief):
+    """Retter små formatvariationer i Claudes svar, så Slack-delen altid virker."""
+    sections = []
+    for s in _as_list(brief.get("sektioner")):
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except Exception:
+                continue
+        if not isinstance(s, dict):
+            continue
+        kilder = []
+        for k in _as_list(s.get("kilder")):
+            if isinstance(k, str):
+                try:
+                    k = json.loads(k)
+                except Exception:
+                    k = {"url": k} if k.startswith("http") else {}
+            if isinstance(k, dict) and k.get("url"):
+                navn = k.get("navn") or urlparse(k["url"]).netloc.replace("www.", "")
+                kilder.append({"navn": navn, "url": k["url"]})
+        sections.append({"key": s.get("key", ""), "overskrift": s.get("overskrift", ""),
+                         "resume": s.get("resume", ""), "kilder": kilder})
+    if not sections:
+        raise RuntimeError("Claudes svar indeholdt ingen brugbare sektioner.")
+    return {"sektioner": sections}
+
+
 def esc(s):
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
