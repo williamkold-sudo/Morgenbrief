@@ -45,7 +45,6 @@ SECTIONS = [
     }},
     {"key": "danmark", "title": "🇩🇰 DANMARK", "feeds": {
         "DR": "https://www.dr.dk/nyheder/service/feeds/allenyheder",
-        "TV 2": "https://feeds.tv2.dk/nyheder/rss",
         # Tilføj flere danske kilder her, fx Politiken eller Altinget,
         # når du har fundet deres RSS-adresse.
     }},
@@ -75,9 +74,42 @@ Regler:
 - Har en sektion kun lidt nyt, så gør den kortere i stedet for at fylde op.
 - Ingen overskrifter med #; du må bruge *fed* sparsomt. Afsnit adskilles med en tom linje.
 
-Svar KUN med gyldig JSON i præcis dette format, uden forklaring og uden kodeblok:
-{"sektioner":[{"key":"verden","overskrift":"...","resume":"...","kilder":[{"navn":"...","url":"..."}]}]}
-Brug præcis disse keys i denne rækkefølge: verden, tek, erhverv, danmark."""
+Aflevér briefen via værktøjet lever_brief med fire sektioner i denne rækkefølge:
+verden, tek, erhverv, danmark."""
+
+# Claude afleverer briefen gennem et "værktøj", så svaret altid er gyldigt struktureret data
+BRIEF_TOOL = {
+    "name": "lever_brief",
+    "description": "Aflevér den færdige morgenbrief.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sektioner": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string",
+                                "enum": ["verden", "tek", "erhverv", "danmark"]},
+                        "overskrift": {"type": "string"},
+                        "resume": {"type": "string"},
+                        "kilder": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"navn": {"type": "string"},
+                                               "url": {"type": "string"}},
+                                "required": ["navn", "url"],
+                            },
+                        },
+                    },
+                    "required": ["key", "overskrift", "resume", "kilder"],
+                },
+            }
+        },
+        "required": ["sektioner"],
+    },
+}
 
 
 # --- Hjælpefunktioner ------------------------------------------------------
@@ -179,11 +211,14 @@ def generate(articles, previous, now):
         model=MODEL,
         max_tokens=4000,
         system=SYSTEM_PROMPT,
+        tools=[BRIEF_TOOL],
+        tool_choice={"type": "tool", "name": "lever_brief"},
         messages=[{"role": "user", "content": "\n\n".join(parts)}],
     )
-    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-    return json.loads(raw)
+    for block in resp.content:
+        if block.type == "tool_use":
+            return block.input
+    raise RuntimeError("Claude leverede ikke nogen brief.")
 
 
 # --- Slack -----------------------------------------------------------------
