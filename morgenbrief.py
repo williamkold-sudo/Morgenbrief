@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,7 +19,8 @@ from anthropic import Anthropic
 
 # --- Indstillinger ---------------------------------------------------------
 TZ = ZoneInfo("Europe/Copenhagen")
-POST_HOUR = 8                      # Poster kun når klokken er 08 i København
+POST_HOUR = 7                      # Briefen postes kl. 07:00 i København
+WINDOW = ((6, 30), (9, 0))         # Kørsler i dette tidsrum må poste (backup ved forsinkelser)
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 LOOKBACK_HOURS = 26
 PER_FEED = 4                       # Maks. artikler pr. feed
@@ -194,10 +196,15 @@ def load_state():
         return {}
 
 
-def save_state(now, text):
+def save_state(now, text, mark_posted=True):
+    """Gemmer briefens tekst. Kun planlagte kørsler markerer dagen som postet,
+    så en manuel testkørsel ikke blokerer morgenens brief."""
+    state = load_state()
+    state["text"] = text
+    if mark_posted:
+        state["date"] = now.date().isoformat()
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"date": now.date().isoformat(), "text": text},
-                                     ensure_ascii=False, indent=2), encoding="utf-8")
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # --- Markedstal ------------------------------------------------------------
@@ -395,11 +402,13 @@ def main():
     state = load_state()
 
     if not force:
-        if now.hour != POST_HOUR:
-            log(f"Klokken er {now:%H:%M} i København – springer over.")
-            return
         if state.get("date") == now.date().isoformat():
             log("Morgenbriefen er allerede postet i dag – springer over.")
+            return
+        start = now.replace(hour=WINDOW[0][0], minute=WINDOW[0][1], second=0, microsecond=0)
+        end = now.replace(hour=WINDOW[1][0], minute=WINDOW[1][1], second=0, microsecond=0)
+        if not (start <= now < end):
+            log(f"Klokken er {now:%H:%M} i København – uden for tidsvinduet, springer over.")
             return
 
     log("MARKEDSTAL")
@@ -416,10 +425,18 @@ def main():
         print(json.dumps(blocks, ensure_ascii=False, indent=2))
         return
 
+    # Er briefen klar før postetidspunktet, venter vi til præcis det klokkeslæt
+    if not force:
+        target = now.replace(hour=POST_HOUR, minute=0, second=0, microsecond=0)
+        wait = (target - datetime.now(TZ)).total_seconds()
+        if wait > 0:
+            log(f"Briefen er klar – venter {int(wait // 60)} min. til kl. {POST_HOUR:02d}:00.")
+            time.sleep(wait)
+
     webhook = os.environ["SLACK_WEBHOOK_URL"]
     r = requests.post(webhook, json={"text": header, "blocks": blocks}, timeout=20)
     r.raise_for_status()
-    save_state(now, to_plain(brief))
+    save_state(now, to_plain(brief), mark_posted=not force)
     log("✅ Morgenbrief postet i Slack.")
 
 
