@@ -21,6 +21,7 @@ from anthropic import Anthropic
 TZ = ZoneInfo("Europe/Copenhagen")
 POST_HOUR = 7                      # Briefen postes kl. 07:00 i København
 WINDOW = ((6, 30), (9, 0))         # Kørsler i dette tidsrum må poste (backup ved forsinkelser)
+PREP_MINUTES = 12                  # Hvor mange minutter før postetidspunktet nyhederne hentes
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 LOOKBACK_HOURS = 26
 PER_FEED = 4                       # Maks. artikler pr. feed
@@ -125,42 +126,32 @@ Regler:
 - Gentag ikke gårsdagens historier, medmindre der er sket noget nyt.
 - Har en sektion kun lidt nyt, så gør den kortere i stedet for at fylde op.
 - Ingen overskrifter med #; brug *fed* sparsomt. Afsnit adskilles med en tom linje.
-- Kilder: 2–4 artikler du faktisk har brugt, som objekter med "navn" (fx "BBC") og "url".
+- Kilder: 2–4 artikler du faktisk har brugt, én pr. linje i formatet: Navn | url
 
-Aflevér briefen via værktøjet lever_brief."""
+Aflevér briefen via værktøjet lever_brief ved at udfylde felterne for hver sektion
+(fx verden_overskrift, verden_resume, verden_pengevinkel, verden_kilder)."""
 
-BRIEF_TOOL = {
-    "name": "lever_brief",
-    "description": "Aflevér den færdige morgenbrief.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "sektioner": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "enum": SECTION_ORDER},
-                        "overskrift": {"type": "string"},
-                        "resume": {"type": "string"},
-                        "pengevinkel": {"type": "string"},
-                        "kilder": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {"navn": {"type": "string"},
-                                               "url": {"type": "string"}},
-                                "required": ["navn", "url"],
-                            },
-                        },
-                    },
-                    "required": ["key", "overskrift", "resume"],
-                },
-            }
-        },
-        "required": ["sektioner"],
-    },
-}
+# Claude afleverer briefen som simple tekstfelter pr. sektion. Flade tekstfelter er
+# langt mere robuste end lister i lister, som tidligere gav formatfejl.
+MONEY_SECTIONS = {"verden", "tek", "erhverv"}
+
+
+def _brief_tool():
+    props, required = {}, []
+    for key in SECTION_ORDER:
+        props[f"{key}_overskrift"] = {"type": "string"}
+        props[f"{key}_resume"] = {"type": "string"}
+        required += [f"{key}_overskrift", f"{key}_resume"]
+        if key in MONEY_SECTIONS:
+            props[f"{key}_pengevinkel"] = {"type": "string"}
+        if key != "danmark":
+            props[f"{key}_kilder"] = {"type": "string",
+                                     "description": "Én kilde pr. linje: Navn | url"}
+    return {"name": "lever_brief", "description": "Aflevér den færdige morgenbrief.",
+            "input_schema": {"type": "object", "properties": props, "required": required}}
+
+
+BRIEF_TOOL = _brief_tool()
 
 
 # --- Hjælpefunktioner ------------------------------------------------------
@@ -298,59 +289,66 @@ def generate(articles, markets, previous, now):
                          f"{a['time']:%Y-%m-%d %H:%M} UTC\n{a['text']}")
 
     client = Anthropic()
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=8000,
-        system=SYSTEM_PROMPT,
-        tools=[BRIEF_TOOL],
-        tool_choice={"type": "tool", "name": "lever_brief"},
-        messages=[{"role": "user", "content": "\n\n".join(parts)}],
-    )
-    for block in resp.content:
-        if block.type == "tool_use":
-            return normalize(block.input)
-    raise RuntimeError("Claude leverede ikke nogen brief.")
+    for attempt in (1, 2):  # Ét genforsøg, kun hvis svaret ikke kan bruges
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=12000,
+            system=SYSTEM_PROMPT,
+            tools=[BRIEF_TOOL],
+            tool_choice={"type": "tool", "name": "lever_brief"},
+            messages=[{"role": "user", "content": "\n\n".join(parts)}],
+        )
+        data = next((b.input for b in resp.content if b.type == "tool_use"), None)
+        try:
+            return normalize(data)
+        except Exception as e:
+            fields = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            log(f"  ⚠️  Forsøg {attempt}: {e} (stop_reason={resp.stop_reason}, felter={fields})")
+    raise RuntimeError("Claude leverede ikke en brugbar brief efter to forsøg.")
 
 
-def _as_list(v):
-    """Accepterer både en liste og en liste skrevet som tekst."""
+def parse_kilder(v):
+    """Læser kilder, uanset om de kommer som linjer 'Navn | url', JSON eller en liste."""
     if isinstance(v, str):
         try:
             v = json.loads(v)
         except Exception:
-            return []
-    return v if isinstance(v, list) else []
+            v = v.splitlines()
+    if not isinstance(v, list):
+        return []
+    out = []
+    for k in v:
+        navn, url = "", ""
+        if isinstance(k, dict):
+            navn, url = k.get("navn", ""), k.get("url", "")
+        elif isinstance(k, str):
+            m = re.search(r"https?://\S+", k)
+            if m:
+                url = m.group(0).rstrip(").,>")
+                navn = k[:m.start()].strip(" -–|:•*")
+        if url:
+            navn = navn or urlparse(url).netloc.replace("www.", "")
+            out.append({"navn": navn, "url": url})
+    return out
 
 
-def normalize(brief):
-    """Retter små formatvariationer i Claudes svar, så Slack-delen altid virker."""
+def normalize(data):
+    if isinstance(data, str):
+        data = json.loads(data)
+    if not isinstance(data, dict):
+        raise RuntimeError("svaret var ikke et objekt")
     sections = []
-    for s in _as_list(brief.get("sektioner")):
-        if isinstance(s, str):
-            try:
-                s = json.loads(s)
-            except Exception:
-                continue
-        if not isinstance(s, dict):
+    for key in SECTION_ORDER:
+        resume = (data.get(f"{key}_resume") or "").strip()
+        if not resume:
             continue
-        kilder = []
-        for k in _as_list(s.get("kilder")):
-            if isinstance(k, str):
-                try:
-                    k = json.loads(k)
-                except Exception:
-                    k = {"url": k} if k.startswith("http") else {}
-            if isinstance(k, dict) and k.get("url"):
-                navn = k.get("navn") or urlparse(k["url"]).netloc.replace("www.", "")
-                kilder.append({"navn": navn, "url": k["url"]})
-        sections.append({"key": s.get("key", ""), "overskrift": s.get("overskrift", ""),
-                         "resume": s.get("resume", ""),
-                         "pengevinkel": s.get("pengevinkel", "") or "",
-                         "kilder": kilder})
-    if not sections:
-        raise RuntimeError("Claudes svar indeholdt ingen brugbare sektioner.")
-    order = {k: i for i, k in enumerate(SECTION_ORDER)}
-    sections.sort(key=lambda s: order.get(s["key"], 99))
+        sections.append({"key": key,
+                         "overskrift": (data.get(f"{key}_overskrift") or "").strip(),
+                         "resume": resume,
+                         "pengevinkel": (data.get(f"{key}_pengevinkel") or "").strip(),
+                         "kilder": parse_kilder(data.get(f"{key}_kilder"))})
+    if len(sections) < 3:
+        raise RuntimeError("svaret indeholdt for få brugbare sektioner")
     return {"sektioner": sections}
 
 
@@ -410,6 +408,14 @@ def main():
         if not (start <= now < end):
             log(f"Klokken er {now:%H:%M} i København – uden for tidsvinduet, springer over.")
             return
+
+    # Kørslen starter tidligt (især om vinteren). Vent, så nyhederne hentes lige før postetidspunktet
+    if not force:
+        prep = now.replace(hour=POST_HOUR, minute=0, second=0, microsecond=0) - timedelta(minutes=PREP_MINUTES)
+        early = (prep - datetime.now(TZ)).total_seconds()
+        if early > 0:
+            log(f"Venter {int(early // 60)} min. før nyhederne hentes.")
+            time.sleep(early)
 
     log("MARKEDSTAL")
     markets = fetch_markets()
