@@ -1,4 +1,4 @@
-"""Daglig pengefokuseret morgenbrief: henter nyheder via RSS og markedstal,
+"""Daglig morgenbrief: henter nyheder via RSS, markedstal og fodboldkampe,
 sammenfatter på dansk med Claude og poster i Slack via en incoming webhook."""
 
 import calendar
@@ -19,31 +19,33 @@ from anthropic import Anthropic
 
 # --- Indstillinger ---------------------------------------------------------
 TZ = ZoneInfo("Europe/Copenhagen")
-POST_HOUR = 7                      # Briefen postes kl. 07:00 i København
-WINDOW = ((6, 30), (9, 0))         # Kørsler i dette tidsrum må poste (backup ved forsinkelser)
-PREP_MINUTES = 12                  # Hvor mange minutter før postetidspunktet nyhederne hentes
+POST_HOUR = 7
+WINDOW = ((6, 30), (9, 0))
+PREP_MINUTES = 12
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 LOOKBACK_HOURS = 26
-PER_FEED = 4                       # Maks. artikler pr. feed
-PER_SECTION = 14                   # Maks. artikler pr. emnegruppe
+PER_FEED = 4
+PER_SECTION = 12
 ARTICLE_CHARS = 2000
 STATE_FILE = Path("state/last_brief.json")
 UA = {"User-Agent": "Mozilla/5.0 (morgenbrief; personal news digest)"}
 
-# Hvem briefen er til. Tilføj gerne din branche og rolle, så karrierevinklen
-# bliver mere præcis, fx: "Arbejder som projektleder i en dansk softwarevirksomhed."
-PROFIL = "Investerer i aktier og ETF'er og vil styrke sin karriere og løn og studerer på nuværende tidspunkt ved CBS international business and politics og er interesseret i en karriere indenfor makroinvestering eller venturekapital."
+PROFIL = (
+    "Investerer i aktier og ETF'er og vil styrke sin karriere og løn og studerer "
+    "på nuværende tidspunkt ved CBS international business and politics og er "
+    "interesseret i en karriere indenfor makroinvestering eller venturekapital."
+)
 
-# Emnegrupper med egne kilder
+# Feeds er råstof. Claude bestemmer sektionerne, ikke feed-navnet.
 FEED_GROUPS = [
     {"key": "verden", "feeds": {
         "BBC": "https://feeds.bbci.co.uk/news/world/rss.xml",
         "The Guardian": "https://www.theguardian.com/world/rss",
         "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+        "Politico Europe": "https://www.politico.eu/feed/",
     }},
     {"key": "tek", "feeds": {
         "The Verge": "https://www.theverge.com/rss/index.xml",
-        "Ars Technica": "https://feeds.arstechnica.com/arstechnica/index",
         "TechCrunch": "https://techcrunch.com/feed/",
         "Hacker News": "https://hnrss.org/frontpage?points=150",
     }},
@@ -59,102 +61,114 @@ FEED_GROUPS = [
     {"key": "danmark", "feeds": {
         "DR": "https://www.dr.dk/nyheder/service/feeds/allenyheder",
     }},
+    {"key": "fodbold", "feeds": {
+        "BBC Sport": "https://feeds.bbci.co.uk/sport/football/rss.xml",
+    }},
 ]
 
-# Sektionerne i Slack, i denne rækkefølge
-SECTION_ORDER = ["vigtigste", "verden", "tek", "erhverv", "muligheder", "danmark"]
+# Rækkefølge i Slack. Tomme sektioner springes over.
+SECTION_ORDER = [
+    "historie1", "historie2", "historie3",
+    "politik", "karriere", "kalender", "fodbold", "danmark",
+]
 TITLES = {
-    "vigtigste": "🔥 DAGENS VIGTIGSTE",
-    "verden": "🌍 VERDEN & POLITIK",
-    "tek": "💻 TEK & AI",
-    "erhverv": "📈 ERHVERV & MARKEDER",
-    "muligheder": "💰 MULIGHEDER & HOLD ØJE MED",
+    "historie1": "📈 MARKEDER",
+    "historie2": "📈 MARKEDER",
+    "historie3": "📈 MARKEDER",
+    "politik": "🌐 INTERNATIONAL POLITIK",
+    "karriere": "💼 KARRIERE",
+    "kalender": "🗓 NÆSTE 48 TIMER",
+    "fodbold": "⚽ FODBOLD",
     "danmark": "🇩🇰 DANMARK",
 }
+# Kun første markedshistorie får sektions-overskriften i Slack.
+SKIP_TITLE = {"historie2", "historie3"}
 
-# Markedslinjen øverst (Yahoo Finance-symboler)
-MARKETS = [
+# Aktiestrippen og krydsaktiv-linjen hentes hver for sig.
+EQUITIES = [
     ("S&P 500", "^GSPC", 0, "idx"),
     ("Nasdaq", "^IXIC", 0, "idx"),
     ("STOXX 600", "^STOXX", 1, "idx"),
     ("C25", "^OMXC25", 0, "idx"),
-    ("EUR/USD", "EURUSD=X", 4, "idx"),
     ("Brent", "BZ=F", 1, "usd"),
     ("Guld", "GC=F", 0, "usd"),
+]
+CROSS_ASSET = [
+    ("US 2-årig", "2YY=F", 2, "rate"),
     ("US 10-årig", "^TNX", 2, "rate"),
+    ("EUR/USD", "EURUSD=X", 4, "idx"),
+    ("HYG", "HYG", 2, "idx"),  # kredit-proxy, ikke et spread
+]
+
+FIXTURE_URLS = [
+    "https://www.bbc.co.uk/sport/football/scores-fixtures",
+    "https://www.bbc.com/sport/football/premier-league/scores-fixtures",
+    "https://www.bbc.com/sport/football/champions-league/scores-fixtures",
 ]
 
 WEEKDAYS = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"]
 MONTHS = ["januar", "februar", "marts", "april", "maj", "juni", "juli",
           "august", "september", "oktober", "november", "december"]
 
-SYSTEM_PROMPT = f"""Du er redaktør på en personlig, pengefokuseret morgenbrief på dansk til én læser.
+SYSTEM_PROMPT = f"""Du er redaktør på en personlig morgenbrief på dansk til én læser.
 Læserens profil: {PROFIL}
-Formålet er, at læseren (1) kender dagens store nyheder og (2) forstår, hvad de betyder
-for hans investeringer og karriere.
+Formålet er, at læseren på omkring 700 ord kender dagens bevægelser i kapital, statslig magt og sin karriereretning.
 
-Du får artikler fra de seneste ca. 24 timer i emnegrupperne verden, tek, erhverv og
-danmark, samt de seneste markedstal. Lav seks sektioner i denne rækkefølge:
+Du får artikler fra de seneste ca. 24 timer, markedstal og et fodboldudtræk. Skriv kun ud fra det. Opfind ingen tal, kampe eller begivenheder.
 
-1. vigtigste – De 2–3 vigtigste historier på tværs af alt. Ca. 100 ord. Ingen pengevinkel.
-2. verden – Resumé på ca. 250 ord + pengevinkel på ca. 50 ord.
-3. tek – Resumé på ca. 250 ord + pengevinkel på ca. 50 ord.
-4. erhverv – Resumé på ca. 250 ord + pengevinkel på ca. 50 ord.
-5. muligheder – Ca. 200 ord: 2–3 konkrete tråde, der er værd at undersøge nærmere for
-   en investor i aktier/ETF'er eller for læserens karriere, samt kommende begivenheder
-   nævnt i artiklerne (rentemøder, regnskaber, afstemninger, deadlines).
-6. danmark – Præcis én sætning om dagens vigtigste danske nyhed.
-I alt ca. 1200 ord.
+Sektioner, i denne rækkefølge:
 
-Resuméerne: ét samlet resumé på tværs af flere artikler og helst flere kilder, ikke én
-historie pr. kilde. Hovedtemaet i dybden plus sekundære udviklinger. Nævn hvor kilderne
-er uenige eller vægter forskelligt.
+1–3. historie1, historie2, historie3 – op til tre markedshistorier. Drop en historie ved at lade felterne være tomme, hvis der ikke er stof nok. Tekn og AI kun med, hvis det flytter kurser, funding eller ansættelser. Danmark kun med her, hvis det rører C25, finanspolitik eller arbejdsmarkedet.
+4. politik – præcis én historie om international politik, skrevet realistisk: stater, kapabiliteter, sikkerhed og relativ fordel. Institutioner er arenaer, ikke aktører. Ingen moral, ingen "regelbaseret orden" som forklaring. Gentag ikke prisbevægelsen fra markedshistorierne; forklar hvem der pressede hvem. Tom, hvis intet har flyttet magtbalancen.
+5. karriere – kort hale, én gren, om kapital eller ansættelser i makro, venture eller growth. Tom, hvis intet konkret er meldt.
+6. kalender – flad liste, næste 48 timer og den næste kendte dato. For hvert nøgletal: forrige tal og konsensus, hvis kilderne har dem.
+7. fodbold – højst fire korte linjer. Kun store kampe i Premier League, Champions League eller landshold, i dag plus næste spilledag inden for tre dage. Modstander, tidspunkt, hvorfor den er den værd at kende. Ingen odds, ingen forudsagt stilling. Tom, hvis udtrækket ikke har en stor kamp.
+8. danmark – to eller tre sætninger, kun hvis dagens stof rører C25, finanspolitik eller arbejdsmarkedet. Ellers tom.
 
-Pengevinklen: hvilke sektorer, typer af virksomheder, råvarer, valutaer eller renter der
-får medvind eller modvind, og hvorfor. Og for karrieren: hvilke kompetencer, brancher og
-roller der er i vækst eller under pres (ansættelser, fyringsrunder, løn). Henvis til
-markedstallene, hvor de viser, hvordan markedet reagerede.
+Format for historie1–3, politik og karriere. Overskriften er påstanden, ikke emnet. Brødteksten er denne kontrakt, én sætning pr. knude, højst to grene:
+
+1. Fakta. Tal mod konsensus, hvis kilderne har begge. Mærk kilden: statistikbureau, centralbank, regnskab, eller "kilder siger" ved et læk. Nævn hvis kilderne er uenige.
+    1.1 Mekanisme: hvorfor faktum flytter renter, indtjening, flows eller kapabilitet.
+        1.1.1 So-what: hvilken sektor, faktor, valuta eller stat der får medvind eller modvind. Et signal, aldrig et køb eller salg.
+
+Kalender og fodbold er flade nummererede linjer, uden 1.1.
+
+Omfang: hele briefen ca. 700 ord eksklusiv fodbold. Politik ca. 150 ord. Karriere ca. 70 ord. Kalender ca. 50 ord. Fyld ikke op. Tom sektion er bedre end en tynd.
 
 Regler:
-- Giv aldrig købs- eller salgsanbefalinger, kursmål eller porteføljeråd. Beskriv signaler,
-  og hvad der er værd at undersøge nærmere.
-- Skeln tydeligt mellem hvad kilderne siger, og din egen vurdering ("det kan betyde ...").
-- Brug kun information fra de vedlagte artikler og markedstal. Opfind intet, heller ikke tal.
-- Skriv naturligt, flydende dansk, også når kilderne er engelske. Behold navne,
-  virksomheder og fagudtryk i deres normale form.
-- Neutral, saglig tone. Ingen hilsen eller afslutning.
-- Gentag ikke gårsdagens historier, medmindre der er sket noget nyt.
-- Har en sektion kun lidt nyt, så gør den kortere i stedet for at fylde op.
-- Ingen overskrifter med #; brug *fed* sparsomt. Afsnit adskilles med en tom linje.
-- Kilder: 2–4 artikler du faktisk har brugt, én pr. linje i formatet: Navn | url
+- Aldrig købs- eller salgsanbefaling, kursmål eller porteføljeråd.
+- Skeln mellem hvad kilderne siger, og din læsning ("det kan betyde ...").
+- Naturligt dansk. Behold navne og fagudtryk.
+- Saglig tone. Ingen hilsen eller afslutning.
+- Gentag ikke gårsdagens historier, medmindre der er noget nyt.
+- Kilder: 2–4 artikler du faktisk har brugt, én pr. linje: Navn | url
 
-Aflevér briefen via værktøjet lever_brief ved at udfylde felterne for hver sektion
-(fx verden_overskrift, verden_resume, verden_pengevinkel, verden_kilder)."""
+Aflevér via lever_brief. Lad felterne være tomme strenge for sektioner du dropper."""
 
-# Claude afleverer briefen som simple tekstfelter pr. sektion. Flade tekstfelter er
-# langt mere robuste end lister i lister, som tidligere gav formatfejl.
-MONEY_SECTIONS = {"verden", "tek", "erhverv"}
+STORY_KEYS = {"historie1", "historie2", "historie3", "politik", "karriere"}
 
 
 def _brief_tool():
-    props, required = {}, []
+    props, required = {}, ["historie1_overskrift", "historie1_resume"]
     for key in SECTION_ORDER:
         props[f"{key}_overskrift"] = {"type": "string"}
         props[f"{key}_resume"] = {"type": "string"}
-        required += [f"{key}_overskrift", f"{key}_resume"]
-        if key in MONEY_SECTIONS:
-            props[f"{key}_pengevinkel"] = {"type": "string"}
-        if key != "danmark":
-            props[f"{key}_kilder"] = {"type": "string",
-                                     "description": "Én kilde pr. linje: Navn | url"}
-    return {"name": "lever_brief", "description": "Aflevér den færdige morgenbrief.",
-            "input_schema": {"type": "object", "properties": props, "required": required}}
+        if key in STORY_KEYS:
+            props[f"{key}_kilder"] = {
+                "type": "string",
+                "description": "Én kilde pr. linje: Navn | url. Tom, hvis sektionen droppes.",
+            }
+    props["kalender_kilder"] = {"type": "string"}
+    return {
+        "name": "lever_brief",
+        "description": "Aflevér den færdige morgenbrief. Tomme strenge betyder, at sektionen droppes.",
+        "input_schema": {"type": "object", "properties": props, "required": required},
+    }
 
 
 BRIEF_TOOL = _brief_tool()
 
 
-# --- Hjælpefunktioner ------------------------------------------------------
 def log(msg):
     print(msg, flush=True)
 
@@ -188,8 +202,6 @@ def load_state():
 
 
 def save_state(now, text, mark_posted=True):
-    """Gemmer briefens tekst. Kun planlagte kørsler markerer dagen som postet,
-    så en manuel testkørsel ikke blokerer morgenens brief."""
     state = load_state()
     state["text"] = text
     if mark_posted:
@@ -198,35 +210,42 @@ def save_state(now, text, mark_posted=True):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# --- Markedstal ------------------------------------------------------------
+def _quote_line(name, symbol, dec, kind):
+    import yfinance as yf
+    closes = yf.Ticker(symbol).history(period="7d")["Close"].dropna()
+    if len(closes) < 2:
+        raise ValueError("for få datapunkter")
+    last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+    if kind == "rate":
+        bp = round((last - prev) * 100)
+        sign = "+" if bp >= 0 else "−"
+        return f"{name} {dk_num(last, dec)} % ({sign}{abs(bp)} bp)"
+    pct = (last / prev - 1) * 100
+    sign = "+" if pct >= 0 else "−"
+    value = dk_num(last, dec) + (" $" if kind == "usd" else "")
+    suffix = " (kredit-proxy)" if name == "HYG" else ""
+    return f"{name} {value} ({sign}{dk_num(abs(pct), 1)} %){suffix}"
+
+
 def fetch_markets():
-    """Returnerer én linje med markedstal. Fejler et tal, springes det over."""
+    """To linjer: aktier/råvarer og krydsaktiv. Et tal der fejler, springes over."""
     try:
-        import yfinance as yf
+        import yfinance  # noqa: F401
     except Exception:
         log("  ⚠️  yfinance ikke installeret – springer markedstal over")
-        return ""
-    parts = []
-    for name, symbol, dec, kind in MARKETS:
-        try:
-            closes = yf.Ticker(symbol).history(period="7d")["Close"].dropna()
-            if len(closes) < 2:
-                raise ValueError("for få datapunkter")
-            last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
-            if kind == "rate":
-                bp = round((last - prev) * 100)
-                parts.append(f"{name} {dk_num(last, dec)} % ({'+' if bp >= 0 else '−'}{abs(bp)} bp)")
-            else:
-                pct = (last / prev - 1) * 100
-                sign = "+" if pct >= 0 else "−"
-                value = dk_num(last, dec) + (" $" if kind == "usd" else "")
-                parts.append(f"{name} {value} ({sign}{dk_num(abs(pct), 1)} %)")
-        except Exception as e:
-            log(f"  ⚠️  {name}: kunne ikke hente kurs ({e})")
-    return " · ".join(parts)
+        return "", ""
+    lines = []
+    for basket in (EQUITIES, CROSS_ASSET):
+        parts = []
+        for name, symbol, dec, kind in basket:
+            try:
+                parts.append(_quote_line(name, symbol, dec, kind))
+            except Exception as e:
+                log(f"  ⚠️  {name}: kunne ikke hente kurs ({e})")
+        lines.append(" · ".join(parts))
+    return lines[0], lines[1]
 
 
-# --- Nyheder ---------------------------------------------------------------
 def fetch_feed(name, url, cutoff):
     try:
         r = requests.get(url, headers=UA, timeout=20)
@@ -239,9 +258,13 @@ def fetch_feed(name, url, cutoff):
         t = entry_time(e)
         if t is None or t < cutoff:
             continue
-        items.append({"source": name, "title": strip_html(e.get("title", "")),
-                      "url": e.get("link", ""), "summary": strip_html(e.get("summary", "")),
-                      "time": t})
+        items.append({
+            "source": name,
+            "title": strip_html(e.get("title", "")),
+            "url": e.get("link", ""),
+            "summary": strip_html(e.get("summary", "")),
+            "time": t,
+        })
     items.sort(key=lambda x: x["time"], reverse=True)
     log(f"  {name}: {len(items)} nye artikler")
     return items[:PER_FEED]
@@ -275,24 +298,43 @@ def collect(cutoff):
     return result
 
 
-# --- Claude ----------------------------------------------------------------
-def generate(articles, markets, previous, now):
+def fetch_fixtures():
+    """Programudtræk, så fodboldlinjerne ikke digtes. Fejler det, droppes sektionen."""
+    chunks = []
+    for url in FIXTURE_URLS:
+        try:
+            r = requests.get(url, headers=UA, timeout=15)
+            r.raise_for_status()
+            text = trafilatura.extract(r.text) or ""
+            if text.strip():
+                chunks.append(f"[{url}]\n{text.strip()[:2500]}")
+        except Exception as e:
+            log(f"  ⚠️  Fodbold: kunne ikke hente {url} ({e})")
+    return "\n\n".join(chunks)
+
+
+def generate(articles, markets, cross, fixtures, previous, now):
     parts = [f"I dag er {danish_date(now)} {now.year}."]
-    parts.append(f"MARKEDSTAL (seneste lukning/kurs og ændring):\n{markets or 'Ikke tilgængelige i dag.'}")
+    parts.append(f"AKTIELINJE:\n{markets or 'Ikke tilgængelig.'}")
+    parts.append(f"KRYDSAKTIV (2-årig, 10-årig, EUR/USD, HYG som kredit-proxy):\n{cross or 'Ikke tilgængelig.'}")
     if previous:
         parts.append(f"GÅRSDAGENS BRIEF (gentag ikke uden nyt):\n{previous}")
+    parts.append("FODBOLDUDTRÆK (brug kun disse kampe, og kun de store):")
+    parts.append(fixtures or "Ingen kampdata hentet. Lad fodbold være tom.")
     parts.append("ARTIKLER:")
     for group in FEED_GROUPS:
         parts.append(f"\n=== EMNEGRUPPE: {group['key']} ===")
         for n, a in enumerate(articles.get(group["key"], []), 1):
-            parts.append(f"[{n}] {a['source']} | {a['title']} | {a['url']} | "
-                         f"{a['time']:%Y-%m-%d %H:%M} UTC\n{a['text']}")
+            parts.append(
+                f"[{n}] {a['source']} | {a['title']} | {a['url']} | "
+                f"{a['time']:%Y-%m-%d %H:%M} UTC\n{a['text']}"
+            )
 
     client = Anthropic()
-    for attempt in (1, 2):  # Ét genforsøg, kun hvis svaret ikke kan bruges
+    for attempt in (1, 2):
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=12000,
+            max_tokens=8000,
             system=SYSTEM_PROMPT,
             tools=[BRIEF_TOOL],
             tool_choice={"type": "tool", "name": "lever_brief"},
@@ -308,7 +350,6 @@ def generate(articles, markets, previous, now):
 
 
 def parse_kilder(v):
-    """Læser kilder, uanset om de kommer som linjer 'Navn | url', JSON eller en liste."""
     if isinstance(v, str):
         try:
             v = json.loads(v)
@@ -342,57 +383,64 @@ def normalize(data):
         resume = (data.get(f"{key}_resume") or "").strip()
         if not resume:
             continue
-        sections.append({"key": key,
-                         "overskrift": (data.get(f"{key}_overskrift") or "").strip(),
-                         "resume": resume,
-                         "pengevinkel": (data.get(f"{key}_pengevinkel") or "").strip(),
-                         "kilder": parse_kilder(data.get(f"{key}_kilder"))})
-    if len(sections) < 3:
-        raise RuntimeError("svaret indeholdt for få brugbare sektioner")
+        sections.append({
+            "key": key,
+            "overskrift": (data.get(f"{key}_overskrift") or "").strip(),
+            "resume": resume,
+            "kilder": parse_kilder(data.get(f"{key}_kilder")),
+        })
+    if not any(s["key"].startswith("historie") for s in sections):
+        raise RuntimeError("svaret manglede en markedshistorie")
     return {"sektioner": sections}
 
 
-# --- Slack -----------------------------------------------------------------
 def esc(s):
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (s or "").replace("&", "&").replace("<", "<").replace(">", ">")
+
+
+def keep_indent(s):
+    """Slack fjerner almindelige indryk. Em-space bevarer note-formatet."""
+    lines = []
+    for line in (s or "").splitlines():
+        n = len(line) - len(line.lstrip(" "))
+        lines.append(("\u2003" * (n // 4)) + line.lstrip(" "))
+    return "\n".join(lines)
 
 
 def text_block(text):
-    # Slack tillader max 3000 tegn pr. tekstblok
     return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2990]}}
 
 
-def build_blocks(brief, markets, now):
+def build_blocks(brief, markets, cross, now):
     header = f"📰 Morgenbrief – {danish_date(now)}"
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": header, "emoji": True}}]
     if markets:
-        blocks.append({"type": "context",
-                       "elements": [{"type": "mrkdwn", "text": f"📊 {esc(markets)}"}]})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"📊 {esc(markets)}"}]})
+    if cross:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"↕ {esc(cross)}"}]})
 
+    shown_markets = False
     for sec in brief["sektioner"]:
-        title = esc(TITLES.get(sec["key"], sec["key"]))
         blocks.append({"type": "divider"})
-        if sec["key"] == "danmark":
-            blocks.append(text_block(f"*{title}:* {esc(sec['resume'])}"))
-            continue
-        blocks.append(text_block(f"*{title}*\n*{esc(sec['overskrift'])}*\n{esc(sec['resume'])}"))
-        extra = ""
-        if sec["pengevinkel"]:
-            extra += f"💸 *Pengevinkel:* {esc(sec['pengevinkel'])}"
+        body = f"*{esc(sec['overskrift'])}*\n{esc(keep_indent(sec['resume']))}" if sec["overskrift"] else esc(keep_indent(sec["resume"]))
+        if sec["key"] not in SKIP_TITLE and not (sec["key"].startswith("historie") and shown_markets):
+            title = esc(TITLES.get(sec["key"], sec["key"]))
+            body = f"*{title}*\n{body}"
+        if sec["key"].startswith("historie"):
+            shown_markets = True
+        blocks.append(text_block(body))
         kilder = " · ".join(f"<{k['url']}|{esc(k['navn'])}>" for k in sec["kilder"])
         if kilder:
-            extra += f"\n_Kilder: {kilder}_"
-        if extra.strip():
-            blocks.append(text_block(extra.strip()))
+            blocks.append(text_block(f"_Kilder: {kilder}_"))
     return header, blocks
 
 
 def to_plain(brief):
-    return "\n\n".join(f"{s['overskrift']}\n{s['resume']}\n{s['pengevinkel']}".strip()
-                       for s in brief["sektioner"])
+    return "\n\n".join(
+        f"{s['overskrift']}\n{s['resume']}".strip() for s in brief["sektioner"]
+    )
 
 
-# --- Main ------------------------------------------------------------------
 def main():
     force = os.getenv("FORCE", "").lower() == "true"
     dry_run = os.getenv("DRY_RUN", "").lower() == "true"
@@ -408,9 +456,6 @@ def main():
         if not (start <= now < end):
             log(f"Klokken er {now:%H:%M} i København – uden for tidsvinduet, springer over.")
             return
-
-    # Kørslen starter tidligt (især om vinteren). Vent, så nyhederne hentes lige før postetidspunktet
-    if not force:
         prep = now.replace(hour=POST_HOUR, minute=0, second=0, microsecond=0) - timedelta(minutes=PREP_MINUTES)
         early = (prep - datetime.now(TZ)).total_seconds()
         if early > 0:
@@ -418,20 +463,21 @@ def main():
             time.sleep(early)
 
     log("MARKEDSTAL")
-    markets = fetch_markets()
+    markets, cross = fetch_markets()
+    log("FODBOLD")
+    fixtures = fetch_fixtures()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     articles = collect(cutoff)
-    if not any(articles.values()):
+    if not any(articles.get(g["key"]) for g in FEED_GROUPS if g["key"] != "fodbold"):
         sys.exit("Ingen artikler fundet – tjek feed-adresserne.")
 
-    brief = generate(articles, markets, state.get("text", ""), now)
-    header, blocks = build_blocks(brief, markets, now)
+    brief = generate(articles, markets, cross, fixtures, state.get("text", ""), now)
+    header, blocks = build_blocks(brief, markets, cross, now)
 
     if dry_run:
         print(json.dumps(blocks, ensure_ascii=False, indent=2))
         return
 
-    # Er briefen klar før postetidspunktet, venter vi til præcis det klokkeslæt
     if not force:
         target = now.replace(hour=POST_HOUR, minute=0, second=0, microsecond=0)
         wait = (target - datetime.now(TZ)).total_seconds()
